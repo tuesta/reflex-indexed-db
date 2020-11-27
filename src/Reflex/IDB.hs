@@ -29,7 +29,7 @@ import           Data.Aeson                        as A
 import           Data.ByteString                   (ByteString)
 import qualified Data.ByteString                   as BS
 import           Data.Default
-import           Data.Dependent.Map                (DSum (..))
+import           Data.Dependent.Sum                (DSum (..))
 import           Data.Functor.Identity
 import           Data.IORef
 import           Data.Maybe                        (fromMaybe)
