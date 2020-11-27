@@ -23,6 +23,7 @@ library
                      , bytestring
                      , transformers    >= 0.4
                      , free            >= 4.12
+                     , dependent-sum   >= 0.7 && < 0.8
                      , dependent-map   >= 0.4 && < 0.5
                      , data-default    >= 0.5
                      , jsaddle
