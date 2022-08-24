@@ -77,10 +77,10 @@ note a = maybe (Left a) Right
 type IDBError = Text
 newtype IDBResult t a = IDBResult (Event t (Either IDBError a))
 
-indexedDB :: forall t m.
-            ( HasWebView m
-            , MonadWidget t m
-            ) => IndexedDBOpen t -> (Database t DOM.JSM ()) -> m (Either IDBError (IndexedDB t))
+indexedDB
+  :: forall t m
+   . MonadWidget t m
+  => IndexedDBOpen t -> (Database t DOM.JSM ()) -> m (Either IDBError (IndexedDB t))
 indexedDB idbReq upgrade = do
   (eOpen, eOpenTrigger) <- newTriggerEvent
   (eUpgrade, eUpgradeTrigger) <- newTriggerEvent
