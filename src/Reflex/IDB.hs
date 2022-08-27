@@ -341,6 +341,7 @@ modifyStore objStore key mS = do
 -- | Reduce
 data ReduceStore v a where
   Lookups  :: [Key] -> ReduceStore v (M.Map Key (Either IDBErr (Maybe v)))
+  Lookup   ::  Key  -> ReduceStore v (Either IDBErr (Maybe v))
   ToMap    :: ReduceStore v (M.Map Key v)
   -- TODO this must be simple to implement
   -- FoldWithKey :: (Key -> v -> b -> b) -> b -> ReduceStore v b
@@ -359,6 +360,8 @@ reduceStore objStore rS =
       M.traverseWithKey
         (\k _ -> getObjS objStore k pure)
         (M.fromList $ zip ks (repeat ()))
+    Lookup k  -> do
+      getObjS objStore k pure
     ToMap -> getAllWithKeyObjS objStore
 
 ------------------------------------------------------------------------------
