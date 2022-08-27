@@ -1,464 +1,435 @@
--- |
+{-# LANGUAGE FlexibleContexts    #-}
+{-# LANGUAGE GADTs               #-}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE RankNTypes          #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications    #-}
 
-{-# LANGUAGE CPP                        #-}
-{-# LANGUAGE DataKinds                  #-}
-{-# LANGUAGE DeriveFunctor              #-}
-{-# LANGUAGE ExistentialQuantification  #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE GADTs                      #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures             #-}
-{-# LANGUAGE LambdaCase                 #-}
-{-# LANGUAGE RankNTypes                 #-}
-{-# LANGUAGE ScopedTypeVariables        #-}
-{-# LANGUAGE TypeApplications           #-}
+module Reflex.IDB
+  ( IDBRef(..), IndexedDBState(..), isClosed, IndexedDB(..)
+  , ObjectStore(..)
+  , ModifyStore(..)
+  , ReduceStore(..)
+  , Key(..)
+  , CloseDB(..), IDBErr(..)
+  , indexedDB
+  , runModifyStore
+  , runReduceStore
+  ) where
 
-module Reflex.IDB where
-
-import           Control.Concurrent.STM            (atomically)
-import qualified Control.Concurrent.STM.TMVar      as STM
-import           Control.Monad
+import           Control.Monad                  (void)
 import           Control.Monad.IO.Class
-import           Control.Monad.Ref
-import           Control.Monad.Trans.Class         (MonadTrans, lift)
-import           Control.Monad.Trans.Except
-import           Control.Monad.Trans.Free
-import           Control.Monad.Trans.Reader
-import           Control.Monad.Trans.State         hiding (get)
-import           Data.Aeson                        as A
-import           Data.ByteString                   (ByteString)
-import qualified Data.ByteString                   as BS
-import           Data.Default
-import           Data.Dependent.Sum                (DSum (..))
-import           Data.Functor.Identity
 import           Data.IORef
-import           Data.Maybe                        (fromMaybe)
-import           Data.Proxy
-import           Data.Text                         (Text)
-import qualified Data.Text                         as T
-import           Data.Word
-import           GHC.TypeLits
-import           GHCJS.DOM
-import qualified GHCJS.DOM.Enums                   as DOM
-import           GHCJS.DOM.EventM
-import qualified GHCJS.DOM.IDBCursor               as IDBCurs
-import qualified GHCJS.DOM.IDBDatabase             as IDBD
-import qualified GHCJS.DOM.IDBFactory              as IDBF
-import qualified GHCJS.DOM.IDBKeyRange             as IDBKeyRan
-import qualified GHCJS.DOM.IDBObjectStore          as IDBStore
-import qualified GHCJS.DOM.IDBOpenDBRequest        as IDBOReq
-import qualified GHCJS.DOM.IDBRequest              as IDBReq
-import qualified GHCJS.DOM.IDBTransaction          as IDBTrans
-import qualified GHCJS.DOM.Types                   as DOM
-import qualified GHCJS.DOM.Window                  as FFIWin
-import           Prelude                           hiding ((!!))
-import           Reflex
-import           Reflex.Dom.Class
-import           Reflex.Dom.Core
-import           Reflex.Host.Class
+import           Data.Maybe                     (fromMaybe)
+import           Prelude                        hiding (lookup, (!!))
+
+import           Control.Concurrent.STM         (atomically)
+import qualified Control.Concurrent.STM.TMQueue as STM
+import qualified Control.Concurrent.STM.TMVar   as STM
 
 
--- | Tag the 'Nothing' value of a 'Maybe'
-note :: a -> Maybe b -> Either a b
-note a = maybe (Left a) Right
+import           Data.Aeson                     (FromJSON (..), FromJSONKey,
+                                                 Result (..), ToJSON (..),
+                                                 ToJSONKey, Value (..),
+                                                 fromJSON)
+import           Data.Aeson.Types               (typeMismatch)
+import qualified Data.Map                       as M
+import           Data.Scientific
+import qualified Data.Text                      as T
 
--- | Convert a 'Maybe' value into the 'ExceptT' monad
-(??) :: Applicative m => Maybe a -> e -> ExceptT e m a
-(??) a e = ExceptT (pure $ note e a)
+import           Reflex                         (current, ffor, holdDyn,
+                                                 leftmost, newTriggerEvent,
+                                                 performEvent, sample)
+import           Reflex.Dom.Core                (Dynamic, Event, MonadSample,
+                                                 MonadWidget)
+import           Reflex.PerformEvent.Class      (Performable)
 
--- | Convert an applicative 'Maybe' value into the 'ExceptT' monad
-(!?) :: Applicative m => m (Maybe a) -> e -> ExceptT e m a
-(!?) a e = ExceptT (note e <$> a)
+import qualified GHCJS.DOM                      as DOM
+import qualified GHCJS.DOM.Enums                as DOM
+import qualified GHCJS.DOM.EventM               as DOM
+import qualified GHCJS.DOM.IDBDatabase          as IDBD
+import qualified GHCJS.DOM.IDBFactory           as IDBF
+import qualified GHCJS.DOM.IDBObjectStore       as IDBStore
+import qualified GHCJS.DOM.IDBOpenDBRequest     as IDBOReq
+import qualified GHCJS.DOM.IDBRequest           as IDBReq
+import qualified GHCJS.DOM.IDBTransaction       as IDBTrans
+import qualified GHCJS.DOM.Types                as DOM
+import qualified GHCJS.DOM.Window               as FFIWin
+import qualified JSDOM.Generated.IDBCursor      as IDBC
+
+import qualified Data.JSString                  as JS
+import qualified Language.Javascript.JSaddle    as JS
+
+-- TODO handle errors properly
 
 -- | Convert an applicative 'Maybe' to a panic
 (!!) :: Applicative m => m (Maybe a) -> String -> m a
 (!!) a e = fmap (fromMaybe (error e)) a
 
-type IDBError = Text
-newtype IDBResult t a = IDBResult (Event t (Either IDBError a))
+onBlocked :: DOM.JSM ()
+onBlocked = pure ()
+
+onError :: DOM.JSM ()
+onError = pure ()
+
+onSuccess :: (IndexedDBState -> IO ()) -> IndexedDBState -> DOM.JSM ()
+onSuccess eOpenTrigger idbSt = liftIO (eOpenTrigger idbSt)
 
 indexedDB
-  :: forall t m
-   . MonadWidget t m
-  => IndexedDBOpen t -> (Database t DOM.JSM ()) -> m (Either IDBError (IndexedDB t))
-indexedDB idbReq upgrade = do
-  (eOpen, eOpenTrigger) <- newTriggerEvent
+  :: forall t m v
+   . (MonadWidget t m, ToJSON v, FromJSON v)
+  => T.Text
+  -> Int
+  -> [ObjectStore v]
+  -> Event t ()
+  -> m (IndexedDB t)
+indexedDB nameDB versionDB stores closeEv = do
+  (eOpen   , eOpenTrigger)    <- newTriggerEvent
   (eUpgrade, eUpgradeTrigger) <- newTriggerEvent
   idbRef <- liftIO $ newIORef Nothing
-  let onBlocked :: DOM.JSM ()
-      onBlocked = return ()
-      onUpgradeNeeded :: DOM.JSM (Either Text ()) -> DOM.JSM ()
-      onUpgradeNeeded upgardeRes = do
-        -- TODO: Probably needs to generalize IO to WidgetHost m
-        --       Requires a fn WidgetHost m (Either Text ()) -> IO (Either Text ())
-        res <- upgardeRes
-        liftIO $ eUpgradeTrigger res
-      onSuccess :: IndexedDBState -> DOM.JSM ()
-      onSuccess idbSt = liftIO $ eOpenTrigger idbSt
-      onError :: DOM.JSM ()
-      onError = do
-        liftIO $ print "error openining db"
-        return ()
-  res <- DOM.liftJSM $ runExceptT $ do
-    wind <- currentWindow !? "Unable to get window object"
-    idbFact <- FFIWin.getIndexedDB wind
-    idbOpenReq <- IDBF.open idbFact idbName (Just idbVer)
-    _ <- DOM.liftJSM $ on idbOpenReq IDBOReq.blocked $ DOM.liftJSM onBlocked
-    _ <- DOM.liftJSM $ on idbOpenReq IDBReq.success $ do
-      tgt <- target
-      let idbReq = maybe (error "Error getting idb request") id tgt :: IDBReq.IDBRequest
-      idbAny <- IDBReq.getResult idbReq !! "Error getting Database"
-      idb <- DOM.castTo IDBD.IDBDatabase idbAny !! "Error converting to database"
-      liftIO $ writeIORef idbRef (Just idb)
-      DOM.liftJSM (onSuccess .  Open . IDBRef =<< liftIO (newIORef idb))
-    _ <- DOM.liftJSM $ on idbOpenReq IDBReq.error $ DOM.liftJSM onError
-    _ <- DOM.liftJSM $ on idbOpenReq IDBOReq.upgradeNeeded $ do
-      idbReq :: IDBReq.IDBRequest <- target !! "Error getting idb request"
-      idbAny <- (IDBReq.getResult idbReq) !! "Error getting database"
-      idb <- DOM.castTo IDBD.IDBDatabase idbAny !! "Error getting idb"
-      let upgradeCode = runDatabase upgrade
-      let res = runExceptT (iterT (interpretDB idb) upgradeCode)
-      DOM.liftJSM $ onUpgradeNeeded res
-      return ()
-    return ()
-  closeE <- performEvent $ ffor (_idb_close idbReq) $ \_ -> do
+  DOM.liftJSM $ do
+    wind       <- DOM.currentWindow !! "Error getting current window"
+    idbFact    <- FFIWin.getIndexedDB wind
+    idbOpenReq <- IDBF.open idbFact nameDB (Just $ fromIntegral versionDB)
+
+    -- IDBOpenDBRequest: blocked event
+    void $ DOM.liftJSM $ DOM.on idbOpenReq IDBOReq.blocked $ DOM.liftJSM onBlocked
+    -- IDBRequest: error event
+    void $ DOM.liftJSM $ DOM.on idbOpenReq IDBReq.error    $ DOM.liftJSM onError
+    -- IDBOpenDBRequest: upgradeneeded event
+    void $ DOM.liftJSM $ DOM.on idbOpenReq IDBOReq.upgradeNeeded $ do
+       idbReq :: IDBReq.IDBRequest <- DOM.target !! "Error getting idb request"
+       idbAny                      <- IDBReq.getResultUnchecked idbReq
+       idb                         <- DOM.unsafeCastTo IDBD.IDBDatabase idbAny
+       mapM_ (runObjectStore idb) stores
+       liftIO $ eUpgradeTrigger ()
+    -- IDBRequest: success even
+    void $ DOM.liftJSM $ DOM.on idbOpenReq IDBReq.success $ do
+       tgt <- DOM.target
+       let idbReq = maybe (error "Error getting idb request") id tgt :: IDBReq.IDBRequest
+       idbAny <- IDBReq.getResult idbReq !! "Error getting Database"
+       idb <- DOM.castTo IDBD.IDBDatabase idbAny !! "Error converting to database"
+       liftIO $ writeIORef idbRef (Just idb)
+       DOM.liftJSM $ onSuccess eOpenTrigger .  Open . IDBRef =<< liftIO (newIORef idb)
+
+  closeE <- performEvent $ ffor closeEv $ \_ -> do
     idbM <- liftIO $ readIORef idbRef
     case (idbM :: Maybe DOM.IDBDatabase) of
       Just idb -> do
         _ <- IDBD.close idb
-        liftIO $ print "Closing........."
         liftIO $ modifyIORef idbRef (const Nothing)
-        return Close
-      Nothing -> return Close
+        pure Close
+      Nothing -> pure Close
+
   let mergedStatus = leftmost [closeE, eOpen]
       isClosedE    = fmap isClosed mergedStatus
       isOpenE      = fmap not isClosedE
   idbState <- holdDyn Close mergedStatus
-  return $ case res of
-    Left e  -> Left (T.pack e)
-    Right _ -> Right $ IndexedDB isOpenE idbState eUpgrade
-  where idbName = _idb_name idbReq
-        idbVer  = _idb_version idbReq
+  return $ IndexedDB isOpenE idbState eUpgrade
 
+data Key = KeyInt Int | KeyString T.Text
+  deriving (Eq, Ord, Show)
 
-interpretDB
-  :: DOM.IDBDatabase
-  -> DatabaseOp t Item DOM.JSM (ExceptT IDBError DOM.JSM ())
-  -> ExceptT IDBError DOM.JSM ()
-interpretDB idb (OpCreateObjectStore storeN opts f) = do
-  liftIO $ print "OpCreateObjectStore"
-  store <- IDBD.createObjectStore idb storeN (Nothing :: Maybe DOM.IDBObjectStoreParameters)
-  f (ObjectStore store)
-interpretDB idb (OpDeleteObjectStore storeN f) = do
-  IDBD.deleteObjectStore idb storeN
-  f
-interpretDB idb (OpIDB act f) =
-  ExceptT $ flip runReaderT (T.pack "tmp") $ runExceptT $ iterT (interpret (T.pack "tmp") undefined) $ runIDB act
+instance ToJSON Key where
+  toJSON (KeyInt    n)   = Number (fromIntegral n)
+  toJSON (KeyString str) = String str
 
+instance FromJSON Key where
+  parseJSON (Number s) = case floatingOrInteger @Double s of
+    Left  _ -> fail $ show s <> ": invalid number"
+    Right n -> pure (KeyInt n)
+  parseJSON (String str) = pure (KeyString str)
+  parseJSON v = typeMismatch "Integer | String" v
+
+instance FromJSONKey Key where
+instance ToJSONKey Key where
+
+data IDBErr = IDBErr | DifferentType
+  deriving Show
+
+keyJSVal :: Key -> DOM.JSM DOM.JSVal
+keyJSVal (KeyInt n)      = DOM.toJSVal n
+keyJSVal (KeyString str) = DOM.toJSVal str
+
+toIDBErr :: Result a -> Either IDBErr a
+toIDBErr (Error   _) = Left DifferentType
+toIDBErr (Success a) = Right a
+
+toMaybe :: Result a -> Maybe a
+toMaybe (Error   _) = Nothing
+toMaybe (Success a) = Just a
+
+getObjS
+  :: forall m a b
+   . ( DOM.MonadJSM m
+     , FromJSON a
+     )
+  => DOM.IDBObjectStore
+  -> Key
+  -> (forall dom. DOM.MonadDOM dom => Either IDBErr (Maybe a) -> dom b)
+  -> m b
+getObjS objStore key f = do
+  let k = keyJSVal key
+  resultVar <- liftIO $ atomically $ STM.newEmptyTMVar
+  req       <- IDBStore.get objStore k
+  void $ DOM.liftJSM $ DOM.on req IDBReq.success $ do
+    r  <- IDBReq.getResult req
+    r' <- case r of
+      Nothing -> pure (Left IDBErr)
+      Just reqResult -> do
+        DOM.liftJSM DOM.syncPoint
+        DOM.liftJSM $ do
+          value <- DOM.toJSVal reqResult
+          fmap (Right Nothing `maybe` fmap Just)
+            . (fmap . fmap) (toIDBErr . fromJSON)
+            . DOM.fromJSVal
+            $ value
+    f r' >>= liftIO . atomically . STM.putTMVar resultVar
+  liftIO (atomically (STM.readTMVar resultVar))
+
+-- getAllObjS
+--   :: forall m
+--    . ( DOM.MonadJSM m
+--      )
+--   => DOM.IDBObjectStore
+--   -> m (Either IDBErr (M.Map Key Value))
+-- getAllObjS objStore = do
+--   resultVar <- liftIO $ atomically $ STM.newEmptyTMVar
+--   req       <- IDBStore.getAllRange objStore Nothing Nothing
+--   void $ DOM.liftJSM $ DOM.on req IDBReq.success $ do
+--     r  <- IDBReq.getResult req
+--     r' <- case r of
+--       Nothing        -> pure (Left IDBErr)
+--       Just reqResult -> do
+--         DOM.liftJSM DOM.syncPoint
+--         DOM.liftJSM $ do
+--           value <- DOM.toJSVal reqResult
+--           fmap (Right M.empty `maybe` id)
+--             . (fmap . fmap) (toIDBErr . fromJSON)
+--             . DOM.fromJSVal
+--             $ value
+--     liftIO $ atomically $ STM.putTMVar resultVar r'
+--   liftIO (atomically (STM.readTMVar resultVar))
+
+getAllWithKeyObjS
+  :: forall m a
+   . ( DOM.MonadJSM m
+     , FromJSON a
+     )
+  => DOM.IDBObjectStore
+  -> m (M.Map Key a)
+getAllWithKeyObjS objStore = do
+  resultQueue <- liftIO STM.newTMQueueIO
+
+  req <- IDBStore.openCursorRange objStore Nothing (Just DOM.IDBCursorDirectionNext)
+  void $ DOM.liftJSM $ DOM.on req IDBReq.success $ do
+    r  <- IDBReq.getResult req
+    emkv <- case r of
+      Nothing        -> pure $ Left ()
+      Just reqResult -> do
+        DOM.liftJSM DOM.syncPoint
+        DOM.liftJSM $ do
+          value  <- DOM.toJSVal reqResult
+          obj    <- JS.makeObject value
+          (cKey, cValue) <- (,) <$> JS.getProp (JS.pack "key") obj
+                                <*> JS.getProp (JS.pack "value") obj
+          (rKey, rValue) <- (,) <$> (fmap . fmap) fromJSON (DOM.fromJSVal cKey)
+                                <*> (fmap . fmap) fromJSON (DOM.fromJSVal cValue)
+
+          let mkv = (,) <$> (rKey >>= toMaybe) <*> (rValue >>= toMaybe)
+          IDBC.continue (IDBC.IDBCursor value) (Nothing :: Maybe DOM.JSVal)
+          pure $ Right mkv
+    case emkv of
+      Left    _ -> liftIO $ atomically $ STM.closeTMQueue resultQueue
+      Right mkv -> liftIO $ atomically $ STM.writeTMQueue resultQueue mkv
+
+  let loop m = do
+        mi <- atomically $ STM.readTMQueue resultQueue
+        case mi of
+          Nothing  -> pure m
+          Just mkv -> loop (maybe m (\(k, v) -> M.insert k v m) mkv)
+
+  liftIO (loop mempty)
+
+------------------------------------------------------------------------------
+-- | IndexedDBState
+
+newtype IDBRef = IDBRef {runIDBRef :: IORef IDBD.IDBDatabase}
+
+data IndexedDBState
+  = Open IDBRef
+  | Close
 
 isClosed :: IndexedDBState -> Bool
 isClosed Close = True
 isClosed _     = False
 
-data IndexedDBOpen t = IndexedDBOpen
-  { _idb_name    :: Text
-  , _idb_version :: Word64
-  , _idb_close   :: Event t ()
-  }
-
-
-newtype IDBRef = IDBRef {runIDBRef :: IORef IDBD.IDBDatabase}
-data IndexedDBState
-  = Open IDBRef
-  | Close
-
-data IndexedDB t = forall item.IndexedDB
+data IndexedDB t = IndexedDB
   { _idb_isOpen      :: Event t Bool
   , _idb_state       :: Dynamic t IndexedDBState
-  , _idb_onUpgrading :: Event t (Either Text ())
+  , _idb_onUpgrading :: Event t ()
   }
 
-data NewObjectStore t
-  = StoreWithAutoKey Text
-  | StoreWithKeyPath Text
 
-data IndexParam = IndexParam
-  { isUnique     :: Bool
-  , isMultiEntry :: Bool
-  , locale       :: Text
-  }
+------------------------------------------------------------------------------
+-- | Object Store
 
-type NewIndex = (Text, Text, Maybe IndexParam)
+data ObjectStore v where
+  CreateStore :: T.Text -> M.Map Key (ModifyStore v) -> ObjectStore v
+  DeleteStore :: T.Text                              -> ObjectStore v
 
-data KeyRange = UpperBound Text Bool
-              | LowerBound Text Bool
-              | Bound (Text, Bool) (Text, Bool)
-              | Only Text
+runObjectStore
+  :: ( DOM.MonadJSM m
+     , ToJSON v, FromJSON v
+     )
+  => IDBD.IDBDatabase
+  -> ObjectStore v
+  -> m ()
+runObjectStore idb (CreateStore name form) = do
+  store <- IDBD.createObjectStore idb name (Nothing :: Maybe DOM.IDBObjectStoreParameters)
+  void $ M.traverseWithKey (modifyStore store) form
+  pure ()
+runObjectStore idb (DeleteStore name) = IDBD.deleteObjectStore idb name
 
+------------------------------------------------------------------------------
+-- | Modify
 
-type KeyOrKeyRange = Either Text KeyRange
+data ModifyStore a
+  = Insert a
+  | Delete
+  | Adjust (a -> a)
+  | Update (a -> Maybe a)
 
-newtype ObjectStore t = ObjectStore {runStore :: DOM.IDBObjectStore}
+-- TODO partially ignore errors
+modifyStore
+  :: forall m a
+   . ( DOM.MonadJSM m
+     , ToJSON a, FromJSON a
+     )
+  => DOM.IDBObjectStore
+  -> Key
+  -> ModifyStore a
+  -> m (Either IDBErr ())
+modifyStore objStore key mS = do
+  let k = keyJSVal key
+  case mS of
+    Delete   -> do
+      IDBStore.delete_ objStore k
+      pure $ Right ()
+    Insert a -> do
+      void $ IDBStore.add objStore (toJSON a) (Just k)
+      DOM.liftJSM DOM.syncPoint
+      pure $ Right ()
+    Adjust f -> do
+      getObjS objStore key $ \case
+        Left  err -> pure (Left err)
+        Right ma  -> do
+          maybe (pure ()) (\a -> IDBStore.put_ objStore (toJSON $ f a) (Just k)) ma
+          pure $ Right ()
+    Update f -> do
+      getObjS objStore key $ \case
+        Left  err -> pure (Left err)
+        Right ma  -> do
+          maybe (pure ())
+                ( maybe (IDBStore.delete_ objStore k)
+                        (\a -> IDBStore.put_ objStore (toJSON a) (Just k)))
+                $ fmap f ma
+          pure $ Right ()
 
-type Dict = ()
+------------------------------------------------------------------------------
+-- | Reduce
+data ReduceStore v a where
+  Lookups  :: [Key] -> ReduceStore v (M.Map Key (Either IDBErr (Maybe v)))
+  ToMap    :: ReduceStore v (M.Map Key v)
+  -- TODO this must be simple to implement
+  -- FoldWithKey :: (Key -> v -> b -> b) -> b -> ReduceStore v b
 
-data DatabaseOp t item (m :: * -> *) f
-  = OpCreateObjectStore Text (Maybe Dict) (ObjectStore t -> f)
-  | OpDeleteObjectStore Text f
---  | OpStore (StoreOp t item m f) f
---  | OpTransaction (IDB t m item) f
-  | OpIDB (IDB t Text m ()) f
-    deriving (Functor)
+reduceStore
+  :: forall m v a
+   . ( DOM.MonadJSM m
+     , ToJSON v, FromJSON v
+     )
+  => DOM.IDBObjectStore
+  -> ReduceStore v a
+  -> m a
+reduceStore objStore rS =
+  case rS of
+    Lookups ks -> do
+      M.traverseWithKey
+        (\k _ -> getObjS objStore k pure)
+        (M.fromList $ zip ks (repeat ()))
+    ToMap -> getAllWithKeyObjS objStore
 
-newtype Database t m a = Database {runDatabase :: FreeT (DatabaseOp t Item m) (ExceptT IDBError m) a}
-                       deriving ( Functor
-                                , Applicative
-                                , Monad
-                                , MonadIO
-                                )
+------------------------------------------------------------------------------
+-- | Modify-Reduce
 
-createObjectStore :: Monad m => Text -> Maybe Dict -> Database t m (ObjectStore t)
-createObjectStore store opts = Database $ liftF $ OpCreateObjectStore store opts id
+modifyWithStore
+  :: ( DOM.MonadJSM m
+     , ToJSON v, FromJSON v
+     )
+  => DOM.IDBDatabase
+  -> T.Text
+  -> M.Map Key (ModifyStore v)
+  -> m (M.Map Key (Either IDBErr ()))
+modifyWithStore idb nameStore mStore = do
+  idbTrans <- IDBD.transaction idb [T.unpack nameStore] (Just DOM.IDBTransactionModeReadwrite)
+  objStore <- IDBTrans.objectStore idbTrans nameStore
+  M.traverseWithKey (modifyStore objStore) mStore
 
-deleteObjectStore :: Monad m => Text -> Database t m ()
-deleteObjectStore store = Database $ liftF $ OpDeleteObjectStore store ()
+reduceWithStore
+  :: ( DOM.MonadJSM m
+     , ToJSON v, FromJSON v
+     )
+  => DOM.IDBDatabase
+  -> T.Text
+  -> ReduceStore v a
+  -> m a
+reduceWithStore idb nameStore rStore = do
+  idbTrans <- IDBD.transaction idb [T.unpack nameStore] (Just DOM.IDBTransactionModeReadonly)
+  objStore <- IDBTrans.objectStore idbTrans nameStore
+  reduceStore objStore rStore
 
-runIDBAction :: Monad m => IDB t Text m () -> Database t m ()
-runIDBAction act = Database $ liftF $ OpIDB act ()
+data CloseDB = CloseDB
+  deriving Show
 
-type St = ()
-data StoreOp t item m f
-  = OpOpenStore Text            (ObjectStore t -> f)
-  | OpAdd         (ObjectStore t) item (Maybe Text) f
-  | OpClear       (ObjectStore t) f
-  | OpCount       (ObjectStore t) (Maybe KeyOrKeyRange) (Either IDBError Int -> f)
-  | OpNewIndex    (ObjectStore t) NewIndex f
-  | OpDelete      (ObjectStore t) Text f
-  | OpDeleteIndex (ObjectStore t) Text f
-  | OpGet         (ObjectStore t) Text (Either IDBError (Maybe item) -> f)
-  | OpGetAll      (ObjectStore t) (Maybe KeyOrKeyRange) (Maybe Int) (Either IDBError [item] -> f)
-  | OpGetAllKeys  (ObjectStore t) (Maybe KeyRange) (Maybe Int) (Either IDBError [Text] -> f)
-  | OpIndex       (ObjectStore t) Text f
-  | OpCursor      (ObjectStore t) (Maybe KeyOrKeyRange) (Maybe DOM.IDBCursorDirection) () (Cursor t St m ()) f
-  | OpKeyCursor   (ObjectStore t) (Maybe KeyRange)      (Maybe DOM.IDBCursorDirection) (Cursor t St m ()) f
-  | OpPut         (ObjectStore t)                   item (Maybe Text) f
-    deriving (Functor)
-
-data CursorOp t item f
-  = OpContinue  f
-  | OpDone      f
-  | OpAdvance   Int f
-  | OpCurrent   (item -> f)
-  | OpCurUpdate item f
-  | OpCurDelete f
-  deriving (Functor)
-
--- newtype IDBCursor t = IDBCursor {runCursor :: IDBCurs.IDBCursor}
-continue :: (Monad m) => Cursor t s m ()
-continue = Cursor $ liftF $ OpContinue ()
-
-done :: (Monad m) => Cursor t s m ()
-done = Cursor $ liftF $ OpDone ()
-
-advance :: (Monad m) => Int -> Cursor t s m ()
-advance n = Cursor $ liftF $ OpAdvance n ()
-
-currentValue :: (Monad m) => Cursor t s m Item
-currentValue = Cursor $ liftF $ OpCurrent id
-
-currentUpdate :: (Monad m) => Item -> Cursor t s m ()
-currentUpdate item = Cursor $ liftF $ OpCurUpdate item ()
-
-currentDelete :: (Monad m) => Cursor t s m ()
-currentDelete = Cursor $ liftF $ OpCurDelete ()
-
-type Item = A.Value
-
-newtype Cursor t s m a = Cursor { runCursor :: FreeT (CursorOp t Item) (ExceptT IDBError (StateT s m)) a}
-                       deriving ( Functor
-                                , Applicative
-                                , Monad
-                                , MonadIO
-                                )
-
-newtype IDB t r m a = IDB { runIDB :: FreeT (StoreOp t Item m) (ExceptT IDBError (ReaderT r m)) a}
-                  deriving ( Functor
-                           , Applicative
-                           , Monad
-                           , MonadIO
-                           )
-
-#ifndef ghcjs_HOST_OS
-instance DOM.MonadJSM m => DOM.MonadJSM (IDB t r m) where
-  liftJSM' = IDB . FreeT . liftM Pure . DOM.liftJSM
-#endif
-
-openStore :: (Monad m) => Text -> IDB t r m (ObjectStore t)
-openStore store = IDB $ liftF $ OpOpenStore store id
-
-createIndex :: (Monad m) => ObjectStore t -> NewIndex -> IDB t r m ()
-createIndex store newIndex = IDB $ liftF $ OpNewIndex store newIndex ()
-
-add :: (Monad m) => (ObjectStore t) -> Item -> Maybe Text -> IDB t r m ()
-add store item key = IDB $ liftF $ OpAdd store item key ()
-
-clear :: (Monad m) => (ObjectStore t) -> IDB t r m ()
-clear store = IDB $ liftF $ OpClear store ()
-
-count :: (Monad m) => (ObjectStore t) -> Maybe KeyOrKeyRange -> IDB t r m (Either IDBError Int)
-count store key = IDB $ liftF $ OpCount store key id
-
-get :: (Monad m) => (ObjectStore t) -> Text -> IDB t r m (Either IDBError (Maybe Item))
-get store key = IDB $ liftF $ OpGet store key id
-
-getAll :: (Monad m) => (ObjectStore t) -> Maybe KeyOrKeyRange -> Maybe Int -> IDB t r m (Either IDBError [Item])
-getAll store key count = IDB $ liftF $ OpGetAll store key count id
-
-openCursor :: (Monad m) => (ObjectStore t) -> Maybe KeyOrKeyRange -> (Maybe DOM.IDBCursorDirection) -> () -> (Cursor t St m ()) -> IDB t r m ()
-openCursor store key dir initState curCode = IDB $ liftF $ OpCursor store key dir initState curCode ()
-
-data TransactionConfig t a = TransactionConfig
-  { _transCfg_scopes  :: [Text]
-  , _transCfg_mode    :: DOM.IDBTransactionMode
-  , _transCfg_trigger :: Event t a
-  , _transCfg_abort   :: Event t ()
-  }
-
-nullErr :: String -> [String] -> Text
-nullErr op args = T.pack $ op ++ " returned null, when called with args" ++ (show args)
-
-runTransaction :: forall t m input output.
-  ( MonadIO m
-  , MonadSample t m
-  , MonadWidget t m
-  ) => IndexedDB t
-    -> TransactionConfig t input
-    -> (forall t1. (Reflex t1) => IDB t1 input (WidgetHost m) output)
-    -> m (Event t (Either IDBError output))
-runTransaction idb transCfg transact = do
-  let trigger = _transCfg_trigger transCfg
-      fixT = const :: IDB t input m1 o -> Event t a -> IDB t input m1 o
-      code = transact `fixT` trigger
-      scopes = case _transCfg_scopes transCfg of
-        (s : _) -> s
-        []      -> error $ "At least one trasanction scope is required"
-  performEvent $ ffor trigger $ \input -> do
-    idbState <- sample $ current $ _idb_state idb
+runWithStore
+  :: MonadWidget t m
+  => (DOM.IDBDatabase -> T.Text -> b -> Performable m o)
+  -> IndexedDB t
+  -> T.Text
+  -> Event t a
+  -> (a -> b)
+  -> m (Event t (Either CloseDB o))
+runWithStore run IndexedDB{_idb_state} nameStore trigger k = do
+  performEvent $ ffor trigger $ \a -> do
+    idbState <- sample $ current $ _idb_state
     case idbState of
-      Close -> return $ Left $ T.pack "Closed"
+      Close        -> pure $ Left CloseDB
       Open idbRef' -> do
-        let idbRef = runIDBRef idbRef'
-        idb <- liftIO $ readIORef idbRef
-        trans <- IDBD.transaction idb (T.unpack <$> _transCfg_scopes transCfg) (Just $ _transCfg_mode transCfg)
-        runReaderT (runExceptT $ iterT (interpret input trans) $ runIDB code) input
+        idb <- liftIO $ readIORef $ runIDBRef idbRef'
+        fmap Right $ run idb nameStore (k a)
 
-interpret
-  :: DOM.MonadJSM m
-  => input
-  -> DOM.IDBTransaction
-  -> StoreOp t Item m (ExceptT IDBError (ReaderT input m) output)
-  -> ExceptT IDBError (ReaderT input m) output
-interpret input idbTrans (OpOpenStore storeN f) = do
-      objStore <- IDBTrans.objectStore idbTrans storeN
-      f $ ObjectStore objStore
-interpret input idbTrans (OpAdd (ObjectStore store) item key f) = do
-      liftIO $ print $ "adding " ++ (show key)
-      req <- IDBStore.add store item key
-      DOM.liftJSM syncPoint
-      f
-interpret input idbTrans (OpClear (ObjectStore store) f) = do
-      req <- IDBStore.clear store
-      f
-interpret input idbTrans (OpCount (ObjectStore store) key f) = do
-      req <- case key of
-        Nothing -> do
-          IDBStore.countRange store Nothing
-        Just (Left keyName) -> do
-          keyVal <- DOM.liftJSM $ DOM.toJSVal keyName
-          IDBStore.count store keyVal
-        Just (Right krange) -> do
-          case krange of
-            UpperBound key' b -> do
-              range <- IDBKeyRan.upperBound key' b
-              IDBStore.countRange store (Just range)
-            LowerBound key' b -> do
-              range <- IDBKeyRan.lowerBound key' b
-              IDBStore.countRange store (Just range)
-            Bound (k1, b1) (k2, b2) -> do
-              range <- IDBKeyRan.bound k1 k2 b1 b2
-              IDBStore.countRange store (Just range)
-            Only k -> do
-              range <- IDBKeyRan.only k
-              IDBStore.countRange store (Just range)
-      f (Left $ T.pack "TODO")
-interpret input idbTrans (OpGet (ObjectStore store) key f) = do
-      keyVal <- DOM.liftJSM $ DOM.toJSVal key
-      resultVar <- liftIO $ atomically $ STM.newEmptyTMVar
-      req <- IDBStore.get store key
-      DOM.liftJSM $ on req IDBReq.success $ do
-        r <- IDBReq.getResult req
-        r' <- case r of
-          Nothing -> return (Left $ T.pack "getResult failed after success event")
-          Just reqResult -> do
-            DOM.liftJSM syncPoint
-            DOM.liftJSM $ fmap Right $ DOM.fromJSVal =<< DOM.toJSVal reqResult
-        liftIO $ atomically $ STM.putTMVar resultVar r'
-      liftIO (atomically (STM.readTMVar resultVar)) >>= f
-interpret input idbTrans (OpGetAll (ObjectStore store) key kcount f) = do
-  error "getAll is not available in GHCJS"
-interpret input idbTrans (OpGetAllKeys (ObjectStore store) key kcount f) = do
-  error "getAllKeys is not available in GHCJS"
-interpret input idbTrans (OpIndex (ObjectStore store) idx f) = do
-      req <- IDBStore.index store idx
-      f
-interpret input idbTrans (OpNewIndex (ObjectStore store) (idxName, key, idxPar_) f) = do
-      idxPar' <- case idxPar_ of
-        Nothing -> return Nothing
-        Just idxPar ->
-          fmap (Just . DOM.IDBIndexParameters) $ DOM.liftJSM $ DOM.toJSVal $ A.object
-                 [ (T.pack "unique"     .= isUnique idxPar)
-                 , (T.pack "multiEntry" .= isMultiEntry idxPar)
-                 , (T.pack "locale"     .= locale idxPar)
-                 ]
-      idx <- IDBStore.createIndex store (idxName) (T.unpack key) idxPar'
-      f
-interpret input idbTrans (OpDelete (ObjectStore store) key f) = do
-      req <- IDBStore.delete store key
-      f
-interpret input idbTrans (OpDeleteIndex (ObjectStore store) key f) = do
-      req <- IDBStore.deleteIndex store key
-      f
-interpret input idbTrans (OpCursor (ObjectStore store) key' move init curOps f) = do
-      req <- case key' of
-        Nothing -> do
-          IDBStore.openCursorRange store Nothing move
-        Just (Left key) -> do
-          IDBStore.openCursor store key move
-        Just (Right krange) -> do
-          case krange of
-            UpperBound key' b -> do
-              range <- IDBKeyRan.upperBound key' b
-              IDBStore.openCursorRange store (Just range) move
-            LowerBound key' b -> do
-              range <- IDBKeyRan.lowerBound key' b
-              IDBStore.openCursorRange store (Just range) move
-            Bound (k1, b1) (k2, b2) -> do
-              range <- IDBKeyRan.bound k1 k2 b1 b2
-              IDBStore.openCursorRange store (Just range) move
-            Only k -> do
-              range <- IDBKeyRan.only k
-              IDBStore.openCursorRange store (Just range) move
-      let cursorRes = runStateT (runExceptT $ iterT (interpretCursor undefined) (runCursor curOps)) init
-      f
-interpret input idbTrans (OpKeyCursor (ObjectStore store) key move curOps f) = do
-      req <- IDBStore.openCursorRange store Nothing move
-      f
-interpret input idbTrans (OpPut (ObjectStore store) item key f) = do
-      req <- IDBStore.put store item (Just key)
-      f
+runModifyStore
+  :: forall t m v a
+   . ( MonadIO m, MonadSample t m, MonadWidget t m
+     , ToJSON v, FromJSON v
+     )
+  => IndexedDB t
+  -> T.Text
+  -> Event t a
+  -> (a -> M.Map Key (ModifyStore v))
+  -> m (Event t (Either CloseDB (M.Map Key (Either IDBErr ()))))
+runModifyStore = runWithStore modifyWithStore
 
-interpretCursor curs (OpContinue f) = do
-      f
-
-getInput :: Monad m => IDB t r m r
-getInput = IDB ((lift . lift) ask)
+runReduceStore
+  :: forall t m v a b
+   . ( MonadIO m, MonadSample t m, MonadWidget t m
+     , ToJSON v, FromJSON v
+     )
+  => IndexedDB t
+  -> T.Text
+  -> Event t a
+  -> (a -> ReduceStore v b)
+  -> m (Event t (Either CloseDB b))
+runReduceStore = runWithStore reduceWithStore

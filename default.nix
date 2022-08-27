@@ -1,8 +1,8 @@
 { reflex-platform ? ((import <nixpkgs> {}).fetchFromGitHub {
     owner = "reflex-frp";
     repo = "reflex-platform";
-    rev = "8f8d5efc7b844d6eb0b9d909beb3450c1db026dd";
-    sha256 = "sha256-oYDetOqfnt/v43xhqb0VI8ulIrNSGby4cJNGRlr/m+g=";
+    rev = "9ebc4aa483e94ea52a20ce3641e72b43328d40ae";
+    sha256 = "sha256-Wl0weU5PznbfRktKk7ZNOfx8RgjsRsbV12wx2rPa1rs=";
   })
  , system ? builtins.currentSystem
 }:
@@ -13,12 +13,12 @@
   packages = {
     reflex-indexed-db = ./.;
   };
-  overrides = self : super : {
 
+  overrides = self : super : {
   };
 
   shells = {
-    ghc   = ["reflex-indexed-db" ];
+    ghc   = ["reflex-indexed-db" "stylish-haskell"];
     ghcjs = ["reflex-indexed-db" ];
   };
 })
