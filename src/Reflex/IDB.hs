@@ -77,11 +77,11 @@ onSuccess :: (IndexedDBState -> IO ()) -> IndexedDBState -> DOM.JSM ()
 onSuccess eOpenTrigger idbSt = liftIO (eOpenTrigger idbSt)
 
 indexedDB
-  :: forall t m v
-   . (MonadWidget t m, ToJSON v, FromJSON v)
+  :: forall t m
+   . MonadWidget t m
   => T.Text
   -> Int
-  -> [ObjectStore v]
+  -> [ObjectStore]
   -> Event t ()
   -> m (IndexedDB t)
 indexedDB nameDB versionDB stores closeEv = do
@@ -275,16 +275,15 @@ data IndexedDB t = IndexedDB
 ------------------------------------------------------------------------------
 -- | Object Store
 
-data ObjectStore v where
-  CreateStore :: T.Text -> M.Map Key (ModifyStore v) -> ObjectStore v
-  DeleteStore :: T.Text                              -> ObjectStore v
+data ObjectStore where
+  CreateStore :: (ToJSON v, FromJSON v)
+              => T.Text -> M.Map Key (ModifyStore v) -> ObjectStore
+  DeleteStore :: T.Text -> ObjectStore
 
 runObjectStore
-  :: ( DOM.MonadJSM m
-     , ToJSON v, FromJSON v
-     )
+  :: DOM.MonadJSM m
   => IDBD.IDBDatabase
-  -> ObjectStore v
+  -> ObjectStore
   -> m ()
 runObjectStore idb (CreateStore name form) = do
   store <- IDBD.createObjectStore idb name (Nothing :: Maybe DOM.IDBObjectStoreParameters)
